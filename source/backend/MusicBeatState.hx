@@ -4,6 +4,13 @@ import flixel.addons.ui.FlxUIState;
 import flixel.addons.transition.FlxTransitionableState;
 import flixel.FlxState;
 import backend.PsychCamera;
+import objects.ErrorPopup;
+
+#if (SScript && MENU_HSCRIPT)
+import tea.SScript;
+import psychlua.LuaUtils;
+import psychlua.HScript;
+#end
 
 class MusicBeatState extends FlxUIState
 {
@@ -21,9 +28,24 @@ class MusicBeatState extends FlxUIState
 		return Controls.instance;
 	}
 
+	public var errorPopup:ErrorPopup;
+
+	public static var instance:MusicBeatState;
 	var _psychCameraInitialized:Bool = false;
 
+	#if (HSCRIPT_ALLOWED && MENU_HSCRIPT)
+	public var hscriptArray:Array<HScript> = [];
+	public var instancesExclude:Array<String> = [];
+	#end
+
 	override function create() {
+		instance = this;
+
+		errorPopup = new ErrorPopup();
+		add(errorPopup);
+
+		callOnHScript('onParentCreate', []);
+
 		var skip:Bool = FlxTransitionableState.skipNextTransOut;
 		#if MODS_ALLOWED Mods.updatedOnState = false; #end
 
@@ -36,7 +58,27 @@ class MusicBeatState extends FlxUIState
 		}
 		FlxTransitionableState.skipNextTransOut = false;
 		timePassedOnState = 0;
+
+		final classSplit = Type.getClassName(Type.getClass(getState())).split('.');
+		for (folder in Mods.directoriesWithFile("assets/", 'scripts/' + classSplit[classSplit.length-1] +'/')) {
+			for (file in FileSystem.readDirectory(folder)) {			
+				#if HSCRIPT_ALLOWED
+				if(file.toLowerCase().endsWith('.hx')) initHScript(folder + file);
+				#end
+			}
+		}
+
+		trace(classSplit[classSplit.length-1]);
+
+		callOnHScript('onParentCreatePost', []);
 	}
+
+	override function add(basic:flixel.FlxBasic) {
+		super.add(basic);
+		insert(members.length-1, errorPopup);
+
+		return basic;
+	} 
 
 	public function initPsychCamera():PsychCamera
 	{
@@ -51,6 +93,7 @@ class MusicBeatState extends FlxUIState
 	public static var timePassedOnState:Float = 0;
 	override function update(elapsed:Float)
 	{
+		callOnHScript('onParentUpdate', [elapsed]);
 		//everyStep();
 		var oldStep:Int = curStep;
 		timePassedOnState += elapsed;
@@ -79,6 +122,8 @@ class MusicBeatState extends FlxUIState
 		});
 
 		super.update(elapsed);
+
+		callOnHScript('onParentUpdatePost', [elapsed]);
 	}
 
 	private function updateSection():Void
@@ -175,6 +220,8 @@ class MusicBeatState extends FlxUIState
 
 		if (curStep % 4 == 0)
 			beatHit();
+
+		callOnHScript('onParentStepHit', []);
 	}
 
 	public var stages:Array<BaseStage> = [];
@@ -186,6 +233,8 @@ class MusicBeatState extends FlxUIState
 			stage.curDecBeat = curDecBeat;
 			stage.beatHit();
 		});
+
+		callOnHScript('onParentBeatHit', []);
 	}
 
 	public function sectionHit():Void
@@ -195,6 +244,8 @@ class MusicBeatState extends FlxUIState
 			stage.curSection = curSection;
 			stage.sectionHit();
 		});
+
+		callOnHScript('onParentSectionHit', []);
 	}
 
 	function stagesFunc(func:BaseStage->Void)
@@ -209,5 +260,139 @@ class MusicBeatState extends FlxUIState
 		var val:Null<Float> = 4;
 		if(PlayState.SONG != null && PlayState.SONG.notes[curSection] != null) val = PlayState.SONG.notes[curSection].sectionBeats;
 		return val == null ? 4 : val;
+	}
+
+	public function callOnHScript(funcToCall:String, args:Array<Dynamic> = null, ?ignoreStops:Bool = false, exclusions:Array<String> = null, excludeValues:Array<Dynamic> = null):Dynamic {
+		var returnVal:Dynamic = LuaUtils.Function_Continue;
+
+		#if (HSCRIPT_ALLOWED && SScript && MENU_HSCRIPT)
+		if(exclusions == null) exclusions = new Array();
+		if(excludeValues == null) excludeValues = new Array();
+		excludeValues.push(LuaUtils.Function_Continue);
+
+		var len:Int = hscriptArray.length;
+		if (len < 1)
+			return returnVal;
+		for(i in 0...len) {
+			var script:HScript = hscriptArray[i];
+			if(script == null || !script.exists(funcToCall) || exclusions.contains(script.origin))
+				continue;
+
+			var myValue:Dynamic = null;
+			try {
+				var callValue = script.call(funcToCall, args);
+				if(!callValue.succeeded)
+				{
+					var e = callValue.exceptions[0];
+					if(e != null)
+					{
+						var len:Int = e.message.indexOf('\n') + 1;
+						if(len <= 0) len = e.message.length;
+						errorPopup.popError('ERROR (${callValue.calledFunction}) - ' + e.message.substr(0, len));
+					}
+				}
+				else
+				{
+					myValue = callValue.returnValue;
+					if((myValue == LuaUtils.Function_StopHScript || myValue == LuaUtils.Function_StopAll) && !excludeValues.contains(myValue) && !ignoreStops)
+					{
+						returnVal = myValue;
+						break;
+					}
+
+					if(myValue != null && !excludeValues.contains(myValue))
+						returnVal = myValue;
+				}
+			}
+		}
+		#end
+
+		return returnVal;
+	}
+
+	#if (SScript && MENU_HSCRIPT)
+	public function initHScript(file:String)
+	{
+		try
+		{
+			var newScript:HScript = new HScript(null, file);
+			if(newScript.parsingException != null)
+			{
+				trace('ERROR ON LOADING: ${newScript.parsingException.message}');
+				errorPopup.popError('ERROR ON LOADING: ${newScript.parsingException.message}');
+				newScript.destroy();
+				return;
+			}
+
+			hscriptArray.push(newScript);
+			if(newScript.exists('onCreate'))
+			{
+				var callValue = newScript.call('onCreate');
+				if(!callValue.succeeded)
+				{
+					for (e in callValue.exceptions)
+					{
+						if (e != null)
+						{
+							var len:Int = e.message.indexOf('\n') + 1;
+							if(len <= 0) len = e.message.length;
+								trace('ERROR ($file: onCreate) - ${e.message.substr(0, len)}');
+								errorPopup.popError('ERROR ($file: onCreate) - ${e.message.substr(0, len)}');
+						}
+					}
+
+					newScript.destroy();
+					hscriptArray.remove(newScript);
+					trace('failed to initialize tea interp!!! ($file)');
+				}
+				else trace('initialized tea interp successfully: $file');
+			}
+
+		}
+		catch(e)
+		{
+			var len:Int = e.message.indexOf('\n') + 1;
+			if(len <= 0) len = e.message.length;
+			trace('ERROR - ' + e.message.substr(0, len));
+			errorPopup.popError('ERROR - ' + e.message.substr(0, len));
+			var newScript:HScript = cast (SScript.global.get(file), HScript);
+			if(newScript != null)
+			{
+				newScript.destroy();
+				hscriptArray.remove(newScript);
+			}
+		}
+	}
+
+	public function setOnHScript(variable:String, arg:Dynamic, exclusions:Array<String> = null) {
+		#if HSCRIPT_ALLOWED
+		if(exclusions == null) exclusions = [];
+		for (script in hscriptArray) {
+			if(exclusions.contains(script.origin))
+				continue;
+
+			if(!instancesExclude.contains(variable))
+				instancesExclude.push(variable);
+			script.set(variable, arg);
+		}
+		#end
+	}
+	#end
+
+	override function destroy() {
+		super.destroy();
+
+		callOnHScript('onParentDestroy', []);
+
+		#if HSCRIPT_ALLOWED
+		for (script in hscriptArray)
+			if(script != null)
+			{
+				script.call('onDestroy');
+				script.destroy();
+			}
+
+		while (hscriptArray.length > 0) hscriptArray.pop();
+		#end
 	}
 }
